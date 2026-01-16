@@ -368,6 +368,70 @@ app.post('/api/inventory/adjust', async (req, res) => {
     }
 });
 
+// Move inventory via stored procedure
+app.post('/api/move', async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const { itemId, quantity, destination, workerId, reason, lotNumber } = req.body;
+
+        if (!itemId) return res.status(400).json({ error: 'Missing itemId' });
+        if (!quantity || Number(quantity) <= 0) return res.status(400).json({ error: 'Invalid quantity' });
+        if (!destination) return res.status(400).json({ error: 'Missing destination' });
+
+        // Resolve product_id by numeric id or SKU
+        let productId = null;
+        if (/^\d+$/.test(String(itemId))) {
+            const p = await client.query('SELECT product_id FROM products WHERE product_id = $1', [Number(itemId)]);
+            if (p.rowCount) productId = p.rows[0].product_id;
+        }
+        if (!productId) {
+            const p2 = await client.query('SELECT product_id FROM products WHERE sku = $1', [String(itemId)]);
+            if (p2.rowCount) productId = p2.rows[0].product_id;
+        }
+        if (!productId) return res.status(400).json({ error: 'Product not found' });
+
+        // Resolve destination location id by location_code
+        const locRes = await client.query('SELECT location_id FROM locations WHERE location_code = $1', [String(destination)]);
+        if (locRes.rowCount === 0) return res.status(400).json({ error: 'Destination location not found' });
+        const toLocationId = locRes.rows[0].location_id;
+
+        // Find a source location that has sufficient quantity
+        const invRes = await client.query(
+            `SELECT inventory_id, location_id, quantity_on_hand
+             FROM inventory
+             WHERE product_id = $1 AND quantity_on_hand >= $2
+             ORDER BY quantity_on_hand DESC
+             LIMIT 1
+             FOR UPDATE`,
+            [productId, Number(quantity)]
+        );
+        if (invRes.rowCount === 0) return res.status(400).json({ error: 'Insufficient quantity in any location' });
+        const fromLocationId = invRes.rows[0].location_id;
+
+        // Call stored procedure
+        await client.query('SELECT move_inventory($1,$2,$3,$4,$5,$6,$7)', [
+            productId,
+            fromLocationId,
+            toLocationId,
+            Number(quantity),
+            lotNumber || null,
+            workerId ? Number(workerId) : null,
+            reason || 'transfer'
+        ]);
+
+        await client.query('COMMIT');
+        res.json({ message: 'Move completed' });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Move error:', err);
+        res.status(500).json({ error: err.message || 'Server error' });
+    } finally {
+        client.release();
+    }
+});
+
 // ============ DASHBOARD API ============
 
 // Get dashboard statistics
